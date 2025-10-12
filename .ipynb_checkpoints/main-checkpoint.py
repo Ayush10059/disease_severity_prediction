@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 
-from config.config import * 
+# from config.config import * 
 from load_and_pickle import * 
 
 from extract_embeddings.tabular_embeddings import *
@@ -13,6 +13,10 @@ from extract_embeddings.image_embeddings import *
 from extract_embeddings.notes_embeddings import *
 
 from transformers import AutoTokenizer, AutoModel
+
+FUSION_OUTPUT_FNAME = 'data/multimodal_features_regex.pkl'
+PICKLE_PATH = 'data/pickle_regex'
+
 
 def process_patient_data(patient, xray_embedder):
     """
@@ -60,7 +64,7 @@ if __name__ == '__main__':
     
     xray_embedder = XRayEmbedder(device=device)
 
-    local_model_path = "models"
+    local_model_path = "models/biobert"
 
     print(f"Loading BioBERT model and tokenizer from local path: {local_model_path}...")
     biobert_tokenizer = AutoTokenizer.from_pretrained(local_model_path)
@@ -82,7 +86,6 @@ if __name__ == '__main__':
             if patient_records: # Check if the list is not empty
                 all_patient_results.extend(patient_records)
 
-    FUSION_OUTPUT_FNAME = 'data/multimodal_features.pkl'
     print(f"Saving final list with {len(all_patient_results)} records to {FUSION_OUTPUT_FNAME}...")
     with open(FUSION_OUTPUT_FNAME, 'wb') as f:
         pickle.dump(all_patient_results, f)

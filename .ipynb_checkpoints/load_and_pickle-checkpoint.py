@@ -22,7 +22,7 @@ ProgressBar().register()
 mimic_iv_path = 'data/mimic_iv/'
 mimic_cxr_path = 'data/mimic_cxr/'
 mimic_note_path = 'data/mimic_note/'
-pickle_path = 'data/pickle/'
+pickle_path = 'data/pickle_regex/'
 
 class MIMICIVData:
     """
@@ -42,9 +42,9 @@ def load_mimiciv():
     print('Starting lazy loading of MIMIC datasets...')
     
     # --- HOSP TABLES (Read Dask DataFrames) ---
-    df_admissions = dd.read_csv(mimic_iv_path + 'hosp/expert_admissions.csv', assume_missing=True, 
+    df_admissions = dd.read_csv(mimic_iv_path + 'hosp/regex_admissions.csv', assume_missing=True, 
                                 dtype={'admission_location': 'object','deathtime': 'object','edouttime': 'object','edregtime': 'object'})
-    df_patients = dd.read_csv(mimic_iv_path + 'hosp/expert_patients.csv', assume_missing=True, 
+    df_patients = dd.read_csv(mimic_iv_path + 'hosp/regex_patients.csv', assume_missing=True, 
                               dtype={'dod': 'object'})
     df_transfers = dd.read_csv(mimic_iv_path + 'hosp/transfers.csv', assume_missing=True, 
                                dtype={'careunit': 'object'})
@@ -77,10 +77,10 @@ def load_mimiciv():
                               dtype={'prev_service': 'object'})
 
     # --- CXR TABLES ---
-    df_cxr_split = dd.read_csv(mimic_cxr_path + 'subset/mimic-cxr-2.0.0-split.csv', assume_missing=True)
-    df_cxr_negbio = dd.read_csv(mimic_cxr_path + 'subset/mimic-cxr-2.0.0-negbio.csv', assume_missing=True)
-    df_cxr_chexpert = dd.read_csv(mimic_cxr_path + 'subset/mimic-cxr-2.0.0-chexpert.csv', assume_missing=True)
-    df_cxr_metadata = dd.read_csv(mimic_cxr_path + 'subset/mimic-cxr-2.0.0-metadata.csv', assume_missing=True, 
+    df_cxr_split = dd.read_csv(mimic_cxr_path + 'subset_regex/mimic-cxr-2.0.0-split.csv', assume_missing=True)
+    df_cxr_negbio = dd.read_csv(mimic_cxr_path + 'subset_regex/mimic-cxr-2.0.0-negbio.csv', assume_missing=True)
+    df_cxr_chexpert = dd.read_csv(mimic_cxr_path + 'subset_regex/mimic-cxr-2.0.0-chexpert.csv', assume_missing=True)
+    df_cxr_metadata = dd.read_csv(mimic_cxr_path + 'subset_regex/mimic-cxr-2.0.0-metadata.csv', assume_missing=True, 
                                         dtype={'dicom_id': 'object'}, blocksize=None)
 
     # --- NOTES TABLES ---
@@ -142,7 +142,7 @@ def load_mimiciv():
     img_cxr_shape = (224, 224)
     
     # Load patient subset IDs and desired severity column
-    df_severity_label = pd.read_csv('data/severity_dataset/expert_report_edema_severity.csv')
+    df_severity_label = pd.read_csv('data/severity_dataset/regex_report_edema_severity.csv')
     cxr_meta = pd.read_csv(os.path.join(mimic_cxr_path, 'mimic-cxr-2.0.0-metadata.csv.gz'), compression='gzip')
 
     df_severity_label = df_severity_label.rename(columns={'edema_severity': 'label'})
@@ -163,7 +163,7 @@ def load_mimiciv():
         filename = row['dicom_id'] + ".dcm"
         
         # Build the full path
-        img_path = os.path.join(mimic_cxr_path + 'subset/files/', top_folder, subject_id_str, study_id_str, filename)
+        img_path = os.path.join(mimic_cxr_path + 'subset_regex/files/', top_folder, subject_id_str, study_id_str, filename)
         
         # Check if the DICOM file exists
         if os.path.exists(img_path):
@@ -217,7 +217,7 @@ def load_mimiciv():
     # Return the MIMICIVData object directly using dictionary unpacking (**)
     return MIMICIVData(**loaded_dfs)
 
-def create_patient_pickles(mimic_data: MIMICIVData, output_dir: str = 'data/pickle'):
+def create_patient_pickles(mimic_data: MIMICIVData, output_dir: str = pickle_path):
     """
     Processes the Dask DataFrames in MIMICIVData patient-by-patient, 
     computes the result, and saves the structured data to individual pickle files.

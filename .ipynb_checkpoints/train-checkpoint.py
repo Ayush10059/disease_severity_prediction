@@ -78,7 +78,7 @@ class PatientFusionDataset(Dataset):
 if __name__ == '__main__':
     # --- Configuration ---
     PREPROCESSED_DATA_PATH = 'data/multimodal_features.pkl'
-    MODEL_SAVE_PATH = 'models/best_attention_model.pth'
+    MODEL_SAVE_PATH = 'models/regex_attention_model.pth'
     
     BATCH_SIZE = 32
     LEARNING_RATE = 1e-4
@@ -102,25 +102,18 @@ if __name__ == '__main__':
     with open(PREPROCESSED_DATA_PATH, 'rb') as f:
         all_records = pickle.load(f)
 
-    # First, split into training+validation (80%) and test (20%)
-    train_val_records, test_records = train_test_split(all_records, test_size=0.2, random_state=42)
-
-    # Save the test set for later
+    train_val_records, test_records = train_test_split(all_records, test_size=0.2, random_state=42, stratify=[r['label'] for r in all_records])
+    
     TEST_SET_PATH = 'data/multimodal_test_set.pkl'
     with open(TEST_SET_PATH, 'wb') as f:
         pickle.dump(test_records, f)
     print(f"Test set saved to {TEST_SET_PATH}")
-
-    # Now, split the remaining data into training (80% of original) and validation (20% of original)
-    # The new test_size should be 0.25 (since 0.25 * 0.8 = 0.2)
-    train_records, val_records = train_test_split(train_val_records, test_size=0.25, random_state=42)
+    
+    train_records, val_records = train_test_split(train_val_records, test_size=0.25, random_state=42, stratify=[r['label'] for r in train_val_records])
     
     train_dataset = PatientFusionDataset(train_records)
     val_dataset = PatientFusionDataset(val_records)
     
-    train_dataset = PatientFusionDataset(train_records)
-    val_dataset = PatientFusionDataset(val_records)
-
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
     print(f"Data loaded. Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
@@ -171,15 +164,25 @@ if __name__ == '__main__':
         model.eval()
         total_val_loss = 0
         correct_predictions = 0
+        total_samples = 0
         with torch.no_grad():
             for batch in val_loader:
-                # ... (the inside of the validation loop remains the same)
+                demo = batch['demographics'].to(device)
+                notes = batch['notes'].to(device)
+                vdense = batch['vision_dense'].to(device)
+                vpred = batch['vision_pred'].to(device)
+                labels = batch['label'].to(device)
+                
+                logits, _ = model(demo, notes, vdense, vpred)
+                loss = criterion(logits, labels)
+                total_val_loss += loss.item()
                 
                 preds = torch.argmax(logits, dim=1)
                 correct_predictions += (preds == labels).sum().item()
+                total_samples += labels.size(0)
 
         avg_val_loss = total_val_loss / len(val_loader)
-        accuracy = correct_predictions / len(val_dataset)
+        accuracy = correct_predictions / total_samples
         print(f"Epoch {epoch+1} | Validation Loss: {avg_val_loss:.4f} | Accuracy: {accuracy:.4f}")
 
         # --- SAVE THE BEST MODEL ---

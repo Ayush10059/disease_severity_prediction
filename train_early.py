@@ -6,54 +6,48 @@ import pickle
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-# --- 1. COPY THE MODEL DEFINITIONS FROM THE PREVIOUS ANSWER ---
+# --- 1. DEFINE THE EARLY FUSION MODEL ---
 
-class AttentionFusion(nn.Module):
-    """An attention module to learn a weighted fusion of different modality embeddings."""
-    def __init__(self, demo_dim, notes_dim, vision_dense_dim, vision_pred_dim, hidden_dim, num_modalities=4):
-        super(AttentionFusion, self).__init__()
-        self.num_modalities = num_modalities
-        self.hidden_dim = hidden_dim
-        self.project_demo = nn.Linear(demo_dim, hidden_dim)
-        self.project_notes = nn.Linear(notes_dim, hidden_dim)
-        self.project_vision_dense = nn.Linear(vision_dense_dim, hidden_dim)
-        self.project_vision_pred = nn.Linear(vision_pred_dim, hidden_dim)
-        self.attention_net = nn.Sequential(
-            nn.Linear(hidden_dim * num_modalities, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_modalities)
-        )
-
-    def forward(self, demo_embed, notes_embed, vision_dense_embed, vision_pred_embed):
-        proj_d = F.relu(self.project_demo(demo_embed))
-        proj_n = F.relu(self.project_notes(notes_embed))
-        proj_v1 = F.relu(self.project_vision_dense(vision_dense_embed))
-        proj_v2 = F.relu(self.project_vision_pred(vision_pred_embed))
-        concat_features = torch.cat([proj_d, proj_n, proj_v1, proj_v2], dim=1)
-        attention_logits = self.attention_net(concat_features)
-        attention_weights = F.softmax(attention_logits, dim=1)
-        projected_modalities = torch.stack([proj_d, proj_n, proj_v1, proj_v2], dim=1)
-        weights = attention_weights.unsqueeze(-1)
-        fused_vector = torch.sum(weights * projected_modalities, dim=1)
-        return fused_vector, attention_weights
-
-class MultimodalClassifier(nn.Module):
+class EarlyFusionClassifier(nn.Module):
+    """
+    A classifier that uses early fusion.
+    It concatenates all modality embeddings into a single large vector
+    and then passes it through a classifier network.
+    """
     def __init__(self, demo_dim, notes_dim, vision_dense_dim, vision_pred_dim, hidden_dim, num_classes):
-        super(MultimodalClassifier, self).__init__()
-        self.fusion_module = AttentionFusion(
-            demo_dim, notes_dim, vision_dense_dim, vision_pred_dim, hidden_dim
+        super(EarlyFusionClassifier, self).__init__()
+        
+        # Calculate the total dimension after concatenating all feature vectors
+        total_input_dim = demo_dim + notes_dim + vision_dense_dim + vision_pred_dim
+        
+        # Define the classifier that takes the single concatenated vector as input.
+        # This is a simple Multi-Layer Perceptron (MLP).
+        self.classifier = nn.Sequential(
+            nn.Linear(total_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.5), # Dropout is a regularization technique to prevent overfitting
+            nn.Linear(hidden_dim, num_classes)
         )
-        self.classifier = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, demo_embed, notes_embed, vision_dense_embed, vision_pred_embed):
-        fused_representation, attention_weights = self.fusion_module(
-            demo_embed, notes_embed, vision_dense_embed, vision_pred_embed
+        """
+        The forward pass concatenates the features and then classifies them.
+        """
+        # 1. Concatenate all modality features along the feature dimension (dim=1)
+        fused_representation = torch.cat(
+            [demo_embed, notes_embed, vision_dense_embed, vision_pred_embed], 
+            dim=1
         )
+        
+        # 2. Pass the single fused vector through the classifier
         output_logits = self.classifier(fused_representation)
-        return output_logits, attention_weights
+        
+        # We return `None` for the second value to maintain a consistent
+        # return signature with the attention model, making the training loop compatible.
+        return output_logits, None
 
 
-# --- 2. CREATE A CUSTOM PYTORCH DATASET ---
+# --- 2. CREATE A CUSTOM PYTORCH DATASET (Unchanged) ---
 
 class PatientFusionDataset(Dataset):
     """Dataset to load the pre-processed multimodal data."""
@@ -78,18 +72,19 @@ class PatientFusionDataset(Dataset):
 if __name__ == '__main__':
     # --- Configuration ---
     PREPROCESSED_DATA_PATH = 'data/multimodal_features.pkl'
-    MODEL_SAVE_PATH = 'models/regex_attention_model.pth'
+    # IMPORTANT: Changed the model save path to reflect the new model type
+    MODEL_SAVE_PATH = 'models/early_fusion_model.pth'
     
     BATCH_SIZE = 32
     LEARNING_RATE = 1e-4
     NUM_EPOCHS = 150
     
-    # IMPORTANT: These dimensions MUST match the output of your embedding functions
-    DEMO_DIM = 10 # Replace with your actual dimension
-    NOTES_DIM = 768 # BioBERT base
-    VISION_DENSE_DIM = 1024 # Example: ResNet avgpool
-    VISION_PRED_DIM = 18 # Example: CheXpert predictions
-    HIDDEN_DIM = 128 # The common projection dimension
+    # These dimensions MUST match the output of your embedding functions
+    DEMO_DIM = 10 
+    NOTES_DIM = 768 
+    VISION_DENSE_DIM = 1024
+    VISION_PRED_DIM = 18
+    HIDDEN_DIM = 128 # The hidden dimension for the classifier MLP
     NUM_CLASSES = 4
 
     best_val_accuracy = 0.0
@@ -97,13 +92,13 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- Load and Split Data ---
+    # --- Load and Split Data (Unchanged) ---
     print(f"Loading data from {PREPROCESSED_DATA_PATH}...")
     with open(PREPROCESSED_DATA_PATH, 'rb') as f:
         all_records = pickle.load(f)
 
     train_val_records, test_records = train_test_split(all_records, test_size=0.2, random_state=42, stratify=[r['label'] for r in all_records])
-    
+
     TEST_SET_PATH = 'data/multimodal_test_set.pkl'
     with open(TEST_SET_PATH, 'wb') as f:
         pickle.dump(test_records, f)
@@ -113,13 +108,14 @@ if __name__ == '__main__':
     
     train_dataset = PatientFusionDataset(train_records)
     val_dataset = PatientFusionDataset(val_records)
-    
+
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
     print(f"Data loaded. Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
 
     # --- Initialize Model, Loss, Optimizer ---
-    model = MultimodalClassifier(
+    # The only change here is instantiating our new EarlyFusionClassifier
+    model = EarlyFusionClassifier(
         demo_dim=DEMO_DIM,
         notes_dim=NOTES_DIM,
         vision_dense_dim=VISION_DENSE_DIM,
@@ -131,26 +127,23 @@ if __name__ == '__main__':
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # --- Training Loop ---
+    # --- Training Loop (Unchanged logic) ---
     for epoch in range(NUM_EPOCHS):
         model.train()
         total_loss = 0
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
         
         for batch in progress_bar:
-            # Move data to the correct device
             demo = batch['demographics'].to(device)
             notes = batch['notes'].to(device)
             vdense = batch['vision_dense'].to(device)
             vpred = batch['vision_pred'].to(device)
             labels = batch['label'].to(device)
             
-            # Forward pass
             optimizer.zero_grad()
-            logits, _ = model(demo, notes, vdense, vpred)
+            logits, _ = model(demo, notes, vdense, vpred) # The call remains the same
             loss = criterion(logits, labels)
             
-            # Backward pass and optimization
             loss.backward()
             optimizer.step()
             
@@ -160,7 +153,7 @@ if __name__ == '__main__':
         avg_train_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1} | Average Training Loss: {avg_train_loss:.4f}")
 
-        # --- Validation Loop ---
+        # --- Validation Loop (Unchanged logic) ---
         model.eval()
         total_val_loss = 0
         correct_predictions = 0
@@ -185,10 +178,8 @@ if __name__ == '__main__':
         accuracy = correct_predictions / total_samples
         print(f"Epoch {epoch+1} | Validation Loss: {avg_val_loss:.4f} | Accuracy: {accuracy:.4f}")
 
-        # --- SAVE THE BEST MODEL ---
+        # --- SAVE THE BEST MODEL (Unchanged logic) ---
         if accuracy > best_val_accuracy:
             best_val_accuracy = accuracy
             torch.save(model.state_dict(), MODEL_SAVE_PATH)
             print(f"New best model saved to {MODEL_SAVE_PATH} with accuracy: {accuracy:.4f}")
-
-        # You can also inspect `attention_weights` here to see what the model is focusing on
