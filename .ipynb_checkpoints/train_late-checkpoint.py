@@ -6,7 +6,7 @@ import pickle
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-# --- 1. DEFINE THE LATE FUSION MODEL ---
+from fusion_dataset import *
 
 class LateFusionClassifier(nn.Module):
     """
@@ -42,28 +42,6 @@ class LateFusionClassifier(nn.Module):
         # return signature, making the training loop compatible.
         return final_logits, None
 
-
-# --- 2. CREATE A CUSTOM PYTORCH DATASET (Unchanged) ---
-
-class PatientFusionDataset(Dataset):
-    """Dataset to load the pre-processed multimodal data."""
-    def __init__(self, data_records):
-        self.records = data_records
-
-    def __len__(self):
-        return len(self.records)
-
-    def __getitem__(self, idx):
-        record = self.records[idx]
-        return {
-            'demographics': torch.tensor(record['demographics'], dtype=torch.float32),
-            'notes': torch.tensor(record['notes'], dtype=torch.float32),
-            'vision_dense': torch.tensor(record['vision_dense'], dtype=torch.float32),
-            'vision_pred': torch.tensor(record['vision_pred'], dtype=torch.float32),
-            'label': torch.tensor(record['label'], dtype=torch.long)
-        }
-
-# --- 3. THE MAIN TRAINING AND EVALUATION SCRIPT ---
 
 if __name__ == '__main__':
     # --- Configuration ---

@@ -6,8 +6,6 @@ import pickle
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-# --- 1. COPY THE MODEL DEFINITIONS FROM THE PREVIOUS ANSWER ---
-
 class AttentionFusion(nn.Module):
     """An attention module to learn a weighted fusion of different modality embeddings."""
     def __init__(self, demo_dim, notes_dim, vision_dense_dim, vision_pred_dim, hidden_dim, num_modalities=4):
@@ -51,29 +49,6 @@ class MultimodalClassifier(nn.Module):
         )
         output_logits = self.classifier(fused_representation)
         return output_logits, attention_weights
-
-
-# --- 2. CREATE A CUSTOM PYTORCH DATASET ---
-
-class PatientFusionDataset(Dataset):
-    """Dataset to load the pre-processed multimodal data."""
-    def __init__(self, data_records):
-        self.records = data_records
-
-    def __len__(self):
-        return len(self.records)
-
-    def __getitem__(self, idx):
-        record = self.records[idx]
-        return {
-            'demographics': torch.tensor(record['demographics'], dtype=torch.float32),
-            'notes': torch.tensor(record['notes'], dtype=torch.float32),
-            'vision_dense': torch.tensor(record['vision_dense'], dtype=torch.float32),
-            'vision_pred': torch.tensor(record['vision_pred'], dtype=torch.float32),
-            'label': torch.tensor(record['label'], dtype=torch.long)
-        }
-
-# --- 3. THE MAIN TRAINING AND EVALUATION SCRIPT ---
 
 if __name__ == '__main__':
     # --- Configuration ---
@@ -190,5 +165,3 @@ if __name__ == '__main__':
             best_val_accuracy = accuracy
             torch.save(model.state_dict(), MODEL_SAVE_PATH)
             print(f"New best model saved to {MODEL_SAVE_PATH} with accuracy: {accuracy:.4f}")
-
-        # You can also inspect `attention_weights` here to see what the model is focusing on

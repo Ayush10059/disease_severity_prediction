@@ -3,115 +3,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import pickle
-from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, roc_auc_score, f1_score
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-# --- 1. COPY ALL MODEL AND DATASET DEFINITIONS ---
-# We need to define the classes so PyTorch can load the saved models.
+from fusion_dataset import *
 
-# --- Attention Fusion Model Classes ---
-class AttentionFusion(nn.Module):
-    def __init__(self, demo_dim, notes_dim, vision_dense_dim, vision_pred_dim, hidden_dim, num_modalities=4):
-        super(AttentionFusion, self).__init__()
-        self.num_modalities = num_modalities
-        self.hidden_dim = hidden_dim
-        self.project_demo = nn.Linear(demo_dim, hidden_dim)
-        self.project_notes = nn.Linear(notes_dim, hidden_dim)
-        self.project_vision_dense = nn.Linear(vision_dense_dim, hidden_dim)
-        self.project_vision_pred = nn.Linear(vision_pred_dim, hidden_dim)
-        self.attention_net = nn.Sequential(
-            nn.Linear(hidden_dim * num_modalities, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_modalities)
-        )
-
-    def forward(self, demo_embed, notes_embed, vision_dense_embed, vision_pred_embed):
-        proj_d = F.relu(self.project_demo(demo_embed))
-        proj_n = F.relu(self.project_notes(notes_embed))
-        proj_v1 = F.relu(self.project_vision_dense(vision_dense_embed))
-        proj_v2 = F.relu(self.project_vision_pred(vision_pred_embed))
-        concat_features = torch.cat([proj_d, proj_n, proj_v1, proj_v2], dim=1)
-        attention_logits = self.attention_net(concat_features)
-        attention_weights = F.softmax(attention_logits, dim=1)
-        projected_modalities = torch.stack([proj_d, proj_n, proj_v1, proj_v2], dim=1)
-        weights = attention_weights.unsqueeze(-1)
-        fused_vector = torch.sum(weights * projected_modalities, dim=1)
-        return fused_vector, attention_weights
-
-class MultimodalClassifier(nn.Module):
-    def __init__(self, demo_dim, notes_dim, vision_dense_dim, vision_pred_dim, hidden_dim, num_classes):
-        super(MultimodalClassifier, self).__init__()
-        self.fusion_module = AttentionFusion(
-            demo_dim, notes_dim, vision_dense_dim, vision_pred_dim, hidden_dim
-        )
-        self.classifier = nn.Linear(hidden_dim, num_classes)
-
-    def forward(self, demo_embed, notes_embed, vision_dense_embed, vision_pred_embed):
-        fused_representation, attention_weights = self.fusion_module(
-            demo_embed, notes_embed, vision_dense_embed, vision_pred_embed
-        )
-        output_logits = self.classifier(fused_representation)
-        return output_logits, attention_weights
-
-# --- Early Fusion Model Class ---
-class EarlyFusionClassifier(nn.Module):
-    def __init__(self, demo_dim, notes_dim, vision_dense_dim, vision_pred_dim, hidden_dim, num_classes):
-        super(EarlyFusionClassifier, self).__init__()
-        total_input_dim = demo_dim + notes_dim + vision_dense_dim + vision_pred_dim
-        self.classifier = nn.Sequential(
-            nn.Linear(total_input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(hidden_dim, num_classes)
-        )
-    def forward(self, demo_embed, notes_embed, vision_dense_embed, vision_pred_embed):
-        fused_representation = torch.cat(
-            [demo_embed, notes_embed, vision_dense_embed, vision_pred_embed], dim=1
-        )
-        output_logits = self.classifier(fused_representation)
-        return output_logits, None
-
-# --- Late Fusion Model Class ---
-class LateFusionClassifier(nn.Module):
-    def __init__(self, demo_dim, notes_dim, vision_dense_dim, vision_pred_dim, num_classes):
-        super(LateFusionClassifier, self).__init__()
-        self.demo_classifier = nn.Linear(demo_dim, num_classes)
-        self.notes_classifier = nn.Linear(notes_dim, num_classes)
-        self.vision_dense_classifier = nn.Linear(vision_dense_dim, num_classes)
-        self.vision_pred_classifier = nn.Linear(vision_pred_dim, num_classes)
-    def forward(self, demo_embed, notes_embed, vision_dense_embed, vision_pred_embed):
-        logits_d = self.demo_classifier(demo_embed)
-        logits_n = self.notes_classifier(notes_embed)
-        logits_v1 = self.vision_dense_classifier(vision_dense_embed)
-        logits_v2 = self.vision_pred_classifier(vision_pred_embed)
-        final_logits = (logits_d + logits_n + logits_v1 + logits_v2) / 4.0
-        return final_logits, None
-
-# --- Dataset Class (Unchanged) ---
-class PatientFusionDataset(Dataset):
-    def __init__(self, data_records):
-        self.records = data_records
-    def __len__(self):
-        return len(self.records)
-    def __getitem__(self, idx):
-        record = self.records[idx]
-        return {
-            'demographics': torch.tensor(record['demographics'], dtype=torch.float32),
-            'notes': torch.tensor(record['notes'], dtype=torch.float32),
-            'vision_dense': torch.tensor(record['vision_dense'], dtype=torch.float32),
-            'vision_pred': torch.tensor(record['vision_pred'], dtype=torch.float32),
-            'label': torch.tensor(record['label'], dtype=torch.long)
-        }
-
-# --- 2. THE MAIN EVALUATION SCRIPT ---
+from train import *
+from train_early import *
+from train_late import *
+from train_gated import *
+from train_cross import *
+from train_cross_gated import *
 
 def evaluate_model(model, test_loader, device):
     """Runs a model on the test set and returns predictions and true labels."""
     model.eval()
     all_preds = []
     all_labels = []
+    all_scores = []
     with torch.no_grad():
         for batch in test_loader:
             demo = batch['demographics'].to(device)
@@ -121,20 +32,59 @@ def evaluate_model(model, test_loader, device):
             labels = batch['label'].to(device)
 
             logits, _ = model(demo, notes, vdense, vpred)
+            scores = F.softmax(logits, dim=1)
             preds = torch.argmax(logits, dim=1)
             
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-    return all_labels, all_preds
+            all_scores.extend(scores.cpu().numpy())
+            
+    return all_labels, all_preds, np.array(all_scores)
 
-def plot_confusion_matrix(cm, class_names, title):
-    """Plots a confusion matrix using seaborn."""
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
-    plt.title(title)
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.show()
+import seaborn as sns
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+
+def save_cm_for_paper(cm, class_names, model_name):
+    """
+    Saves a normalized, paper-ready confusion matrix as a PDF.
+    """
+    # --- Create a 'figures' directory if it doesn't exist ---
+    output_dir = 'figures'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        
+    # --- Normalize the confusion matrix ---
+    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    
+    # --- Set up the plot ---
+    plt.figure(figsize=(3.5, 3)) 
+    
+    heatmap = sns.heatmap(
+        cm_normalized, 
+        annot=True,            # Show numbers in cells
+        fmt=".2f",             # Format as 2-decimal floats (e.g., 0.90)
+        cmap='Blues',          # Use a simple, print-friendly colormap
+        xticklabels=class_names, 
+        yticklabels=class_names,
+        cbar=False             # No colorbar to save space
+    )
+    
+    # --- Set labels (use a font size that will be readable) ---
+    plt.ylabel('True Label', fontsize=10)
+    plt.xlabel('Predicted Label', fontsize=10)
+    plt.xticks(fontsize=8)
+    plt.yticks(fontsize=8)
+    
+    # --- Generate a safe filename and save as PDF ---
+    safe_filename = model_name.replace(' ', '_').replace('(', '').replace(')', '')
+    output_path = os.path.join(output_dir, f"cm_{safe_filename}.pdf")
+    
+    plt.savefig(output_path, bbox_inches='tight')
+    plt.close()
+    
+    return output_path
 
 
 if __name__ == '__main__':
@@ -149,6 +99,7 @@ if __name__ == '__main__':
     VISION_PRED_DIM = 18
     HIDDEN_DIM = 128
     NUM_CLASSES = 4
+    NUM_HEADS = 8
     CLASS_NAMES = [f'Class {i}' for i in range(NUM_CLASSES)] # Or replace with actual names
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -165,17 +116,29 @@ if __name__ == '__main__':
 
     # --- Models to Evaluate ---
     models_to_evaluate = {
-        "Attention Fusion": {
-            "path": "models/regex_attention_model.pth",
-            "class": MultimodalClassifier(DEMO_DIM, NOTES_DIM, VISION_DENSE_DIM, VISION_PRED_DIM, HIDDEN_DIM, NUM_CLASSES)
+        "Late Fusion": {
+            "path": "models/late_fusion_model.pth",
+            "class": LateFusionClassifier(DEMO_DIM, NOTES_DIM, VISION_DENSE_DIM, VISION_PRED_DIM, NUM_CLASSES)
         },
         "Early Fusion": {
             "path": "models/early_fusion_model.pth",
             "class": EarlyFusionClassifier(DEMO_DIM, NOTES_DIM, VISION_DENSE_DIM, VISION_PRED_DIM, HIDDEN_DIM, NUM_CLASSES)
         },
-        "Late Fusion": {
-            "path": "models/late_fusion_model.pth",
-            "class": LateFusionClassifier(DEMO_DIM, NOTES_DIM, VISION_DENSE_DIM, VISION_PRED_DIM, NUM_CLASSES)
+        "Attention Fusion": {
+            "path": "models/regex_attention_model.pth",
+            "class": MultimodalClassifier(DEMO_DIM, NOTES_DIM, VISION_DENSE_DIM, VISION_PRED_DIM, HIDDEN_DIM, NUM_CLASSES)
+        },
+        "Modality Gating": {
+            "path": "models/modality_gating_model.pth",
+            "class": ModalityGatingClassifier(DEMO_DIM, NOTES_DIM, VISION_DENSE_DIM, VISION_PRED_DIM, HIDDEN_DIM, NUM_CLASSES)
+        },
+        "Cross-Attention Fusion": {
+            "path": "models/cross_attention_model.pth",
+            "class": CrossAttentionFusionClassifier(DEMO_DIM, NOTES_DIM, VISION_DENSE_DIM, VISION_PRED_DIM, HIDDEN_DIM, NUM_HEADS, NUM_CLASSES)
+        },
+        "Cross Modality Gating": {
+            "path": "models/cross_gated_attention_model.pth",
+            "class": GatedFusionClassifier(DEMO_DIM, NOTES_DIM, VISION_DENSE_DIM, VISION_PRED_DIM, HIDDEN_DIM, NUM_HEADS, NUM_CLASSES)
         }
     }
 
@@ -194,15 +157,35 @@ if __name__ == '__main__':
             continue
             
         # Get predictions
-        true_labels, predictions = evaluate_model(model, test_loader, device)
+        true_labels, predictions, scores = evaluate_model(model, test_loader, device)
         
         # Calculate and print metrics
         accuracy = accuracy_score(true_labels, predictions)
+
+        # F1 SCORE
+        f1_macro = f1_score(true_labels, predictions, average='macro')
+        f1_weighted = f1_score(true_labels, predictions, average='weighted')
+        
         print(f"Overall Accuracy: {accuracy:.4f}\n")
+        print(f"Macro F1 Score: {f1_macro:.4f}")
+        print(f"Weighted F1 Score: {f1_weighted:.4f}\n")
+
+        # Calculate and print AUROC for multiclass
+        try:
+            # Check if all classes are present in the true labels
+            if len(np.unique(true_labels)) == NUM_CLASSES:
+                 auroc = roc_auc_score(true_labels, scores, multi_class='ovr', average='macro')
+                 print(f"Macro AUROC (One-vs-Rest): {auroc:.4f}\n")
+            else:
+                 print("AUROC not calculated: not all classes were present in the test set.\n")
+        except ValueError as e:
+            print(f"Could not calculate AUROC: {e}\n")
         
         print("Classification Report:")
         print(classification_report(true_labels, predictions, target_names=CLASS_NAMES))
         
         # Calculate and plot confusion matrix
         cm = confusion_matrix(true_labels, predictions)
-        plot_confusion_matrix(cm, CLASS_NAMES, f'Confusion Matrix - {model_name}')
+        
+        fig_path = save_cm_for_paper(cm, CLASS_NAMES, model_name)
+        print(f"Saved confusion matrix to: {fig_path}")
