@@ -19,9 +19,11 @@ import torch
 import torch.nn.functional as F
 from sklearn.preprocessing import OrdinalEncoder
 from tqdm import tqdm
+from load_mimic import find_radiology_csv_path, attach_radiology_to_cohort_df
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.join(ROOT_DIR, "data_lake") if os.path.isdir(os.path.join(ROOT_DIR, "data_lake")) else ROOT_DIR
 DEFAULT_COHORT_PATH = os.path.join(BASE_DIR, "silver", "balanced_multimodal_cohort.parquet")
 DEFAULT_CXR_DIR = os.path.join(BASE_DIR, "bronze", "mimic_cxr")
 DEFAULT_ADM_PATH = os.path.join(BASE_DIR, "bronze", "mimic_iv", "admissions.csv")
@@ -101,6 +103,169 @@ CLINICAL_SEVERITY_CONCEPTS = [
 ]
 COMPILED_CONCEPT_PATS = [re.compile(p, re.IGNORECASE) for p in CLINICAL_SEVERITY_CONCEPTS]
 
+# Dedicated section & sentence-level hierarchy patterns for radiology.csv.gz reports
+RAD_SECTION_START_RE = re.compile(r"\b(?:FINDINGS|IMPRESSION|CONCLUSION|REPORT)\s*[:_]", re.IGNORECASE)
+RAD_IMPRESSION_START_RE = re.compile(r"\b(?:IMPRESSION|CONCLUSION)\s*[:_]", re.IGNORECASE)
+RAD_PREAMBLE_LINE_RE = re.compile(
+    r"^\s*(?:EXAMINATION|INDICATION|REASON\s+FOR\s+EXAM|CLINICAL\s+INFORMATION|CLINICAL\s+HISTORY|HISTORY|TECHNIQUE|COMPARISON)\s*[:_].*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+PSEUDO_NEG_UNCHANGED_RE = re.compile(
+    r"\bno\s+(?:significant\s+|interval\s+|substantial\s+|definite\s+)*change\b",
+    re.IGNORECASE,
+)
+PSEUDO_NEG_PERSISTENT_RE = re.compile(
+    r"\b(?:no|without)\s+(?:significant\s+|interval\s+)*improvement\b|\bnot\s+(?:significantly\s+)?improved\b",
+    re.IGNORECASE,
+)
+CLAUSE_NEG_SPLIT_RE = re.compile(
+    r"\b(?:no|not|without|never|absent|none|free\s+of|negative\s+for|resolved|resolution\s+of|clearing\s+of|disappearance\s+of|rule\s+out|r/o|excluded|no\s+evidence\s+of|no\s+radiographic\s+evidence\s+of)\b",
+    re.IGNORECASE,
+)
+
+AFFIRMED_G3_RE = re.compile(
+    r"\b(?:severe|marked|extensive|florid|flash|fulminant|massive|moderate\s+to\s+severe|moderate-to-severe)\s+(?:[a-z]+\s+){0,2}(?:edema|congestion|chf|overload)\b"
+    r"|\b(?:alveolar\s+pulmonary\s+edema|pulmonary\s+alveolar\s+edema|alveolar\s+edema|airspace\s+edema|air\s+space\s+edema|batwing|bat-wing|perihilar\s+alveolar|confluent\s+alveolar|diffuse\s+alveolar)\b",
+    re.IGNORECASE,
+)
+AFFIRMED_G2_RE = re.compile(
+    r"\b(?:moderate|mild\s+to\s+moderate|mild-to-moderate)\s+(?:[a-z]+\s+){0,2}(?:edema|congestion|chf|overload)\b"
+    r"|\b(?:interstitial\s+pulmonary\s+edema|pulmonary\s+interstitial\s+edema|interstitial\s+edema|peribronchial\s+edema|kerley|peribronchial\s+cuffing|interlobular\s+septal\s+thickening|fissural\s+thickening|fluid\s+in\s+the\s+fissures|interstitial\s+prominence|interstitial\s+haziness)\b",
+    re.IGNORECASE,
+)
+AFFIRMED_G1_RE = re.compile(
+    r"\b(?:mild|slight|minimal|trace|early|borderline)\s+(?:[a-z]+\s+){0,2}(?:edema|congestion|chf|overload|prominence|engorgement)\b"
+    r"|\b(?:pulmonary\s+vascular\s+congestion|vascular\s+congestion|pulmonary\s+venous\s+congestion|venous\s+congestion|pulmonary\s+congestion|central\s+congestion|hilar\s+congestion|cephalization|redistribution|pulmonary\s+venous\s+hypertension|vascular\s+prominence|vascular\s+engorgement|hilar\s+fullness|hilar\s+engorgement|prominent\s+pulmonary\s+vasculature)\b",
+    re.IGNORECASE,
+)
+AFFIRMED_UNQUAL_EDEMA_RE = re.compile(r"\b(?:pulmonary\s+edema|pulmonary\s+oedema)\b", re.IGNORECASE)
+AFFIRMED_CLEAR_RE = re.compile(
+    r"\b(?:lungs\s+are\s+clear|clear\s+lungs|lungs\s+clear|well\s+expanded\s+and\s+clear|no\s+acute\s+cardiopulmonary|no\s+acute\s+intrathoracic|unremarkable)\b",
+    re.IGNORECASE,
+)
+NEGATED_EDEMA_CONG_RE = re.compile(
+    r"\b(?:edema|oedema|congestion|cephalization|kerley|interstitial|alveolar|overload|chf)\b",
+    re.IGNORECASE,
+)
+
+
+def _stitch_text(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    t = PERIPHERAL_EDEMA_RE.sub(" peripheral_swelling ", text)
+    t = HEADER_COLON_RE.sub(r"\1 \2", t)
+    for _ in range(3):
+        t = WRAP_LOWER_RE.sub(r"\1 \2", t)
+        t = MODIFIER_TAIL_RE.sub(r"\1 \2", t)
+    return t
+
+
+def extract_radiology_sections(rad_text: str):
+    """
+    Extracts the cleaned FINDINGS+IMPRESSION body (`rad_study_clean`) and the IMPRESSION
+    section (`rad_impression`) from a dedicated MIMIC-IV-Note `radiology.csv.gz` report,
+    stripping the INDICATION / REASON FOR EXAM preamble so clinical order requests
+    (e.g., 'INDICATION: eval for pulmonary edema') do not cause false positives.
+    """
+    if not isinstance(rad_text, str) or not rad_text.strip():
+        return "", ""
+
+    cleaned = _stitch_text(rad_text)
+    cleaned_no_preamble = RAD_PREAMBLE_LINE_RE.sub(" ", cleaned)
+
+    sec_match = RAD_SECTION_START_RE.search(cleaned_no_preamble)
+    if sec_match:
+        rad_study_clean = cleaned_no_preamble[sec_match.start() :].strip()
+    else:
+        rad_study_clean = cleaned_no_preamble.strip()
+
+    imp_match = RAD_IMPRESSION_START_RE.search(rad_study_clean)
+    if imp_match:
+        imp_part = rad_study_clean[imp_match.start() :].strip()
+        findings_part = rad_study_clean[: imp_match.start()].strip()
+        findings_sents = [
+            s.strip()
+            for s in re.split(r"[\n.;]+", findings_part)
+            if len(s.strip()) >= 4 and RAD_KEYWORDS.search(s)
+        ]
+        rad_impression = (imp_part + " . " + " . ".join(findings_sents)).strip()
+    else:
+        rad_impression = rad_study_clean
+
+    return rad_study_clean[:6000], rad_impression[:4000]
+
+
+def _score_section_hierarchy(section_text: str) -> np.ndarray:
+    """
+    Evaluates sentence-by-sentence affirmed vs. negated severity concepts in a radiology
+    section and returns a 10-d vector:
+      [g0_neg, g1_aff, g2_aff, g3_aff, unqual_edema, is_g0, is_g1, is_g2, is_g3, expected_grade]
+    """
+    if not isinstance(section_text, str) or not section_text.strip():
+        return np.zeros(10, dtype=np.float32)
+
+    norm_t = PSEUDO_NEG_UNCHANGED_RE.sub(" unchanged_finding ", section_text)
+    norm_t = PSEUDO_NEG_PERSISTENT_RE.sub(" persistent_finding ", norm_t)
+
+    g0_neg = 0.0
+    g1_aff = 0.0
+    g2_aff = 0.0
+    g3_aff = 0.0
+    unqual_pe = 0.0
+
+    for sent in re.split(r"[\n.;]+", norm_t):
+        s = sent.strip()
+        if len(s) < 4:
+            continue
+        if AFFIRMED_CLEAR_RE.search(s):
+            g0_neg += 1.0
+
+        # Split at contrast conjunctions first
+        subclauses = re.split(r"\b(?:but|however|although|though|except|whereas|yet)\b", s, flags=re.IGNORECASE)
+        for clause in subclauses:
+            neg_m = CLAUSE_NEG_SPLIT_RE.search(clause)
+            if neg_m:
+                aff_part = clause[: neg_m.start()]
+                neg_part = clause[neg_m.end() :]
+            else:
+                aff_part = clause
+                neg_part = ""
+
+            if neg_part and NEGATED_EDEMA_CONG_RE.search(neg_part):
+                g0_neg += 1.0
+
+            if aff_part:
+                has_g3 = bool(AFFIRMED_G3_RE.search(aff_part))
+                has_g2 = bool(AFFIRMED_G2_RE.search(aff_part))
+                has_g1 = bool(AFFIRMED_G1_RE.search(aff_part))
+                if has_g3:
+                    g3_aff += 1.0
+                if has_g2:
+                    g2_aff += 1.0
+                if has_g1:
+                    g1_aff += 1.0
+                if (not has_g3 and not has_g2 and not has_g1) and AFFIRMED_UNQUAL_EDEMA_RE.search(aff_part):
+                    unqual_pe += 1.0
+                    g2_aff += 0.65
+
+    # Radiological severity hierarchy: 3 > 2 > 1 > 0
+    one_hot = np.zeros(4, dtype=np.float32)
+    if g3_aff > 0:
+        one_hot[3] = 1.0
+        exp_grade = 3.0
+    elif g2_aff > 0:
+        one_hot[2] = 1.0
+        exp_grade = 2.0
+    elif g1_aff > 0:
+        one_hot[1] = 1.0
+        exp_grade = 1.0
+    else:
+        one_hot[0] = 1.0
+        exp_grade = 0.0
+
+    counts_log = np.log1p(np.array([g0_neg, g1_aff, g2_aff, g3_aff, unqual_pe], dtype=np.float32))
+    return np.concatenate([counts_log, one_hot, np.array([exp_grade / 3.0], dtype=np.float32)])
+
 
 def extract_focused_clinical_text(text: str, max_chars: int = 4000) -> str:
     """
@@ -125,22 +290,21 @@ def extract_focused_clinical_text(text: str, max_chars: int = 4000) -> str:
     return text[:max_chars]
 
 
-def extract_radiology_and_concepts(text: str):
+def extract_radiology_and_concepts(
+    discharge_text: str,
+    radiology_text: str = None,
+    admission_radiology_text: str = None,
+    use_rad_schema: bool = False,
+):
     """
     1. Masks peripheral/extremity edema mentions so 'edema' strictly reflects cardiopulmonary edema.
     2. Repairs 70-character hard line-wraps inside sentences so negations and severity modifiers
        (e.g., 'without frank\\npulmonary edema', 'moderate\\ninterstitial edema') remain intact.
-    3. Extracts full-stay radiology text (`rad_full`), early-stay/admission radiology text (`rad_early`),
-       and a 28-d log-count vector of explicit clinical severity concepts (`concept_vec`).
+    3. When `use_rad_schema` is True (`radiology.csv.gz` aligned to cohort), extracts the dedicated CXR
+       study FINDINGS+IMPRESSION (`rad_study_clean`) and IMPRESSION (`rad_impression`), combining
+       them with discharge radiology context and hierarchical severity concept vectors (72-d).
     """
-    if not isinstance(text, str) or not text.strip():
-        return "", "", np.zeros(len(COMPILED_CONCEPT_PATS) * 2, dtype=np.float32)
-
-    t = PERIPHERAL_EDEMA_RE.sub(" peripheral_swelling ", text)
-    t = HEADER_COLON_RE.sub(r"\1 \2", t)
-    for _ in range(3):
-        t = WRAP_LOWER_RE.sub(r"\1 \2", t)
-        t = MODIFIER_TAIL_RE.sub(r"\1 \2", t)
+    t = _stitch_text(discharge_text)
 
     segs = re.split(r"[\n.;]+", t)
     matched = []
@@ -157,17 +321,52 @@ def extract_radiology_and_concepts(text: str):
                     matched.append(nxt)
 
     if matched:
-        rad_full = " . ".join(matched)[:8000]
+        disch_rad_full = " . ".join(matched)[:8000]
         k_half = max(2, (len(matched) + 1) // 2)
-        rad_early = " . ".join(matched[:k_half])[:4000]
+        disch_rad_early = " . ".join(matched[:k_half])[:4000]
     else:
-        rad_full = t[:4000]
-        rad_early = t[:2000]
+        disch_rad_full = t[:4000]
+        disch_rad_early = t[:2000]
 
-    concept_counts = [len(p.findall(rad_full)) for p in COMPILED_CONCEPT_PATS] + [
-        len(p.findall(rad_early)) for p in COMPILED_CONCEPT_PATS
-    ]
-    concept_vec = np.log1p(np.array(concept_counts, dtype=np.float32))
+    has_rad_note = isinstance(radiology_text, str) and len(radiology_text.strip()) > 20
+    if use_rad_schema:
+        if has_rad_note:
+            rad_study_clean, rad_impression = extract_radiology_sections(radiology_text)
+            adm_rad_clean, _ = extract_radiology_sections(
+                admission_radiology_text
+                if isinstance(admission_radiology_text, str) and admission_radiology_text.strip()
+                else radiology_text
+            )
+            rad_early = f"{rad_impression} . {rad_study_clean}"[:6000]
+            rad_full = f"{rad_study_clean} . {adm_rad_clean} . {disch_rad_early}"[:10000]
+        else:
+            rad_study_clean = disch_rad_early
+            rad_impression = disch_rad_early
+            rad_early = disch_rad_early
+            rad_full = disch_rad_full
+
+        base_counts = (
+            [len(p.findall(rad_study_clean)) for p in COMPILED_CONCEPT_PATS]
+            + [len(p.findall(rad_impression)) for p in COMPILED_CONCEPT_PATS]
+            + [len(p.findall(disch_rad_early)) for p in COMPILED_CONCEPT_PATS]
+        )
+        hier_study = _score_section_hierarchy(rad_study_clean)
+        hier_imp = _score_section_hierarchy(rad_impression)
+        hier_disch = _score_section_hierarchy(disch_rad_early)
+        concept_vec = np.concatenate([
+            np.log1p(np.array(base_counts, dtype=np.float32)),
+            hier_study,
+            hier_imp,
+            hier_disch,
+        ]).astype(np.float32)
+    else:
+        rad_full = disch_rad_full
+        rad_early = disch_rad_early
+        concept_counts = [len(p.findall(rad_full)) for p in COMPILED_CONCEPT_PATS] + [
+            len(p.findall(rad_early)) for p in COMPILED_CONCEPT_PATS
+        ]
+        concept_vec = np.log1p(np.array(concept_counts, dtype=np.float32))
+
     return rad_full, rad_early, concept_vec
 
 
@@ -414,6 +613,24 @@ def extract_cohort_features(
     df = pd.read_parquet(cohort_path)
     print(f"Total cohort rows: {len(df)}")
 
+    rad_csv_path = find_radiology_csv_path()
+    if rad_csv_path and ("radiology_text" not in df.columns or int(df["radiology_text"].notna().sum()) == 0):
+        df = attach_radiology_to_cohort_df(df, rad_csv_path)
+        try:
+            df.to_parquet(cohort_path, compression="zstd", index=False)
+            print(f"Saved radiology-enriched silver cohort to: {cohort_path}")
+        except Exception as e:
+            print(f"Note: Could not overwrite silver cohort parquet ({e}), proceeding in memory.")
+
+    cohort_has_rad = bool("radiology_text" in df.columns and int(df["radiology_text"].notna().sum()) > 0)
+    if cohort_has_rad:
+        print(
+            f"Using dedicated CXR radiology reports (`radiology.csv.gz`): "
+            f"{int(df['radiology_text'].notna().sum())} / {len(df)} matched!"
+        )
+    else:
+        print("Using discharge summary radiology sections (`discharge.csv`).")
+
     print("1. Extracting demographic & clinical tabular features across full cohort...")
     full_demo_matrix = build_demographic_features(df)
     df["cohort_row_idx"] = np.arange(len(df))
@@ -448,15 +665,36 @@ def extract_cohort_features(
 
     print("2. Extracting stitched radiology segments, cardiopulmonary sentences, and clinical severity concepts...")
     raw_texts = df["discharge_text"].tolist()
-    focused_texts = [extract_focused_clinical_text(t) for t in raw_texts]
-    rad_tuples = [extract_radiology_and_concepts(t) for t in raw_texts]
+    rad_texts = df["radiology_text"].tolist() if "radiology_text" in df.columns else [None] * len(df)
+    adm_rad_texts = (
+        df["admission_radiology_text"].tolist() if "admission_radiology_text" in df.columns else rad_texts
+    )
+
+    rad_tuples = [
+        extract_radiology_and_concepts(
+            discharge_text=raw_texts[i],
+            radiology_text=rad_texts[i],
+            admission_radiology_text=adm_rad_texts[i],
+            use_rad_schema=cohort_has_rad,
+        )
+        for i in range(len(df))
+    ]
+    if cohort_has_rad:
+        focused_texts = [
+            f"{rad_tuples[i][1][:2000]} . {extract_focused_clinical_text(raw_texts[i], max_chars=2500)}"[:4000]
+            for i in range(len(df))
+        ]
+    else:
+        focused_texts = [extract_focused_clinical_text(t) for t in raw_texts]
 
     need_vision = [
         (int(h) not in cached_by_hadm) or ("vision_dense" not in cached_by_hadm[int(h)])
         for h in df["hadm_id"]
     ]
     need_notes = refresh_notes or any(
-        (int(h) not in cached_by_hadm) or ("focused_text" not in cached_by_hadm[int(h)])
+        (int(h) not in cached_by_hadm)
+        or ("focused_text" not in cached_by_hadm[int(h)])
+        or (bool(cached_by_hadm[int(h)].get("has_radiology_csv", False)) != cohort_has_rad)
         for h in df["hadm_id"]
     )
 
@@ -498,6 +736,7 @@ def extract_cohort_features(
             "label": np.int64(row["edema_severity"]),
             "label_source": str(row["label_source"]),
             "source_priority": int(row["source_priority"]),
+            "has_radiology_csv": cohort_has_rad,
             "focused_text": focused_texts[idx],
             "rad_full": rad_full,
             "rad_early": rad_early,

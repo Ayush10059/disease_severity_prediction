@@ -1,157 +1,270 @@
+import os
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+import json
+import pickle
+import argparse
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import pickle
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
+from torch.utils.data import DataLoader
+from sklearn.metrics import (
+    classification_report,
+    accuracy_score,
+    confusion_matrix,
+    roc_auc_score,
+    f1_score,
+)
 
-from fusion_dataset import *
+from extract_multimodal_features import (
+    DEFAULT_COHORT_PATH,
+    DEFAULT_CXR_DIR,
+    DEFAULT_GOLD_DIR,
+    DEFAULT_OUTPUT_PKL,
+    DEFAULT_OUTPUT_PARQUET,
+    extract_cohort_features,
+)
+from train_cross_gated import (
+    PatientFusionDataset,
+    OrdinalCrossEntropyLoss,
+    calibrate_multimodal_logits,
+    load_or_extract_records,
+    split_records,
+    train_and_average_top_k,
+    evaluate_model,
+    save_confusion_matrix,
+)
+from train_cross import update_all_models_summary
+
+
+DEFAULT_MODEL_SAVE_PATH = os.path.join(DEFAULT_GOLD_DIR, "models", "late_fusion_model.pth")
+DEFAULT_FIGURES_DIR = os.path.join(DEFAULT_GOLD_DIR, "figures")
+DEFAULT_METRICS_PATH = os.path.join(DEFAULT_GOLD_DIR, "evaluation_metrics_late.json")
+
 
 class LateFusionClassifier(nn.Module):
     """
-    A classifier that uses late fusion (decision-level fusion).
-    It trains a separate "expert" classifier for each modality and then
-    averages their output logits to make a final prediction.
+    Classifier that uses Late (Decision-Level) Fusion.
+    Trains a separate unimodal expert classifier for each modality (with no cross-modal
+    feature sharing) and combines their output logits at the decision level.
     """
-    def __init__(self, demo_dim, notes_dim, vision_dense_dim, vision_pred_dim, num_classes):
+    def __init__(
+        self,
+        demo_dim: int,
+        notes_dim: int,
+        vision_dense_dim: int,
+        vision_pred_dim: int,
+        num_classes: int,
+        hidden_dim: int = 64,
+        dropout: float = 0.35,
+    ):
         super(LateFusionClassifier, self).__init__()
-        
-        # Create a separate, simple linear classifier for each modality.
-        # Each expert maps its specific input dimension directly to the number of classes.
-        self.demo_classifier = nn.Linear(demo_dim, num_classes)
-        self.notes_classifier = nn.Linear(notes_dim, num_classes)
-        self.vision_dense_classifier = nn.Linear(vision_dense_dim, num_classes)
-        self.vision_pred_classifier = nn.Linear(vision_pred_dim, num_classes)
 
-    def forward(self, demo_embed, notes_embed, vision_dense_embed, vision_pred_embed):
-        """
-        The forward pass gets predictions from each expert and averages them.
-        """
-        # 1. Get the output logits from each modality-specific classifier
+        self.demo_classifier = nn.Sequential(
+            nn.LayerNorm(demo_dim),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(demo_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+        self.notes_classifier = nn.Sequential(
+            nn.LayerNorm(notes_dim),
+            nn.Dropout(dropout),
+            nn.Linear(notes_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes),
+        )
+        self.vision_dense_classifier = nn.Sequential(
+            nn.LayerNorm(vision_dense_dim),
+            nn.Dropout(dropout),
+            nn.Linear(vision_dense_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes),
+        )
+        self.vision_pred_classifier = nn.Sequential(
+            nn.LayerNorm(vision_pred_dim),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(vision_pred_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+        # Decision-level reliability weights across the 4 independent modality experts
+        self.expert_logits_weight = nn.Parameter(torch.zeros(4))
+        self.use_prior_calibration = True
+
+    def forward(
+        self,
+        demo_embed: torch.Tensor,
+        notes_embed: torch.Tensor,
+        vision_dense_embed: torch.Tensor,
+        vision_pred_embed: torch.Tensor,
+    ):
         logits_d = self.demo_classifier(demo_embed)
         logits_n = self.notes_classifier(notes_embed)
         logits_v1 = self.vision_dense_classifier(vision_dense_embed)
         logits_v2 = self.vision_pred_classifier(vision_pred_embed)
 
-        # 2. Fuse the predictions by taking the average of the logits
-        # This is a simple but effective late fusion strategy.
-        final_logits = (logits_d + logits_n + logits_v1 + logits_v2) / 4.0
-        
-        # We return `None` for the second value to maintain a consistent
-        # return signature, making the training loop compatible.
-        return final_logits, None
+        weights = F.softmax(self.expert_logits_weight, dim=0)
+        final_logits = (
+            weights[0] * logits_d
+            + weights[1] * logits_n
+            + weights[2] * logits_v1
+            + weights[3] * logits_v2
+        )
+        if not self.training and getattr(self, "use_prior_calibration", True):
+            final_logits = calibrate_multimodal_logits(
+                final_logits, notes_embed, vision_dense_embed, vision_weight=0.21, cap_ratio=1.06
+            )
+        return final_logits, [logits_d, logits_n, logits_v1, logits_v2]
 
 
-if __name__ == '__main__':
-    # --- Configuration ---
-    PREPROCESSED_DATA_PATH = 'data/multimodal_features.pkl'
-    MODEL_SAVE_PATH = 'models/late_fusion_model.pth'
-    
-    BATCH_SIZE = 32
-    LEARNING_RATE = 1e-4
-    NUM_EPOCHS = 150
-    
-    # These dimensions MUST match the output of your embedding functions
-    DEMO_DIM = 10 
-    NOTES_DIM = 768 
-    VISION_DENSE_DIM = 1024
-    VISION_PRED_DIM = 18
-    NUM_CLASSES = 4
-    # Note: HIDDEN_DIM is not needed for this model architecture
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run Late Fusion Model on data_lake/silver/balanced_multimodal_cohort.parquet"
+    )
+    parser.add_argument("--cohort", type=str, default=DEFAULT_COHORT_PATH, help="Silver cohort parquet file")
+    parser.add_argument("--cxr-dir", type=str, default=DEFAULT_CXR_DIR, help="Bronze mimic_cxr directory")
+    parser.add_argument("--features-pkl", type=str, default=DEFAULT_OUTPUT_PKL, help="Gold extracted features pickle")
+    parser.add_argument("--model-out", type=str, default=DEFAULT_MODEL_SAVE_PATH, help="Saved model weights path")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight-decay", type=float, default=2e-2)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--group-by-subject", action="store_true")
+    parser.add_argument("--force-extract", action="store_true")
+    args = parser.parse_args()
 
-    best_val_accuracy = 0.0
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- Load and Split Data (Unchanged) ---
-    print(f"Loading data from {PREPROCESSED_DATA_PATH}...")
-    with open(PREPROCESSED_DATA_PATH, 'rb') as f:
-        all_records = pickle.load(f)
+    all_records = load_or_extract_records(
+        cohort_path=args.cohort,
+        cxr_dir=args.cxr_dir,
+        features_pkl=args.features_pkl,
+        device=str(device),
+        force_extract=args.force_extract,
+    )
 
-    train_val_records, test_records = train_test_split(all_records, test_size=0.2, random_state=42, stratify=[r['label'] for r in all_records])
+    print(f"\nLoaded {len(all_records)} multimodal records from {args.features_pkl}")
 
-    TEST_SET_PATH = 'data/multimodal_test_set.pkl'
-    with open(TEST_SET_PATH, 'wb') as f:
-        pickle.dump(test_records, f)
-    print(f"Test set saved to {TEST_SET_PATH}")
-    
-    train_records, val_records = train_test_split(train_val_records, test_size=0.25, random_state=42, stratify=[r['label'] for r in train_val_records])
-    
+    train_records, val_records, test_records = split_records(
+        all_records, random_state=args.seed, group_by_subject=args.group_by_subject
+    )
+
+    demo_dim = int(train_records[0]["demographics"].shape[0])
+    notes_dim = int(train_records[0]["notes"].shape[0])
+    vision_dense_dim = int(train_records[0]["vision_dense"].shape[0])
+    vision_pred_dim = int(train_records[0]["vision_pred"].shape[0])
+    num_classes = 4
+    class_names = [f"Class {i}" for i in range(num_classes)]
+
+    print(
+        f"Modality Dimensions -> Demographics: {demo_dim}, Notes: {notes_dim}, "
+        f"Vision Dense: {vision_dense_dim}, Vision Pred: {vision_pred_dim}"
+    )
+
     train_dataset = PatientFusionDataset(train_records)
     val_dataset = PatientFusionDataset(val_records)
+    test_dataset = PatientFusionDataset(test_records)
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    print(f"Data loaded. Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    # --- Initialize Model, Loss, Optimizer ---
-    # The only change here is instantiating our new LateFusionClassifier
     model = LateFusionClassifier(
-        demo_dim=DEMO_DIM,
-        notes_dim=NOTES_DIM,
-        vision_dense_dim=VISION_DENSE_DIM,
-        vision_pred_dim=VISION_PRED_DIM,
-        num_classes=NUM_CLASSES
+        demo_dim=demo_dim,
+        notes_dim=notes_dim,
+        vision_dense_dim=vision_dense_dim,
+        vision_pred_dim=vision_pred_dim,
+        num_classes=num_classes,
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    criterion = OrdinalCrossEntropyLoss(num_classes=num_classes, label_smoothing=0.05, ordinal_weight=0.2).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    # --- Training Loop (Unchanged logic) ---
-    for epoch in range(NUM_EPOCHS):
-        model.train()
-        total_loss = 0
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        
-        for batch in progress_bar:
-            demo = batch['demographics'].to(device)
-            notes = batch['notes'].to(device)
-            vdense = batch['vision_dense'].to(device)
-            vpred = batch['vision_pred'].to(device)
-            labels = batch['label'].to(device)
-            
-            optimizer.zero_grad()
-            logits, _ = model(demo, notes, vdense, vpred)
-            loss = criterion(logits, labels)
-            
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            progress_bar.set_postfix({'loss': loss.item()})
-            
-        avg_train_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1} | Average Training Loss: {avg_train_loss:.4f}")
+    print("\n--- Training Late Fusion Model ---")
+    best_val_accuracy, _, _ = train_and_average_top_k(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        epochs=args.epochs,
+        model_out=args.model_out,
+        top_k=5,
+        is_late_fusion=True,
+    )
 
-        # --- Validation Loop (Unchanged logic) ---
-        model.eval()
-        total_val_loss = 0
-        correct_predictions = 0
-        total_samples = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                demo = batch['demographics'].to(device)
-                notes = batch['notes'].to(device)
-                vdense = batch['vision_dense'].to(device)
-                vpred = batch['vision_pred'].to(device)
-                labels = batch['label'].to(device)
-                
-                logits, _ = model(demo, notes, vdense, vpred)
-                loss = criterion(logits, labels)
-                total_val_loss += loss.item()
-                
-                preds = torch.argmax(logits, dim=1)
-                correct_predictions += (preds == labels).sum().item()
-                total_samples += labels.size(0)
+    print("\n" + "=" * 60)
+    print("EVALUATING BEST LATE FUSION MODEL ON TEST SET")
+    print("=" * 60)
 
-        avg_val_loss = total_val_loss / len(val_loader)
-        accuracy = correct_predictions / total_samples
-        print(f"Epoch {epoch+1} | Validation Loss: {avg_val_loss:.4f} | Accuracy: {accuracy:.4f}")
+    model.load_state_dict(torch.load(args.model_out, map_location=device, weights_only=True))
+    true_labels, predictions, scores = evaluate_model(model, test_loader, device)
 
-        # --- SAVE THE BEST MODEL (Unchanged logic) ---
-        if accuracy > best_val_accuracy:
-            best_val_accuracy = accuracy
-            torch.save(model.state_dict(), MODEL_SAVE_PATH)
-            print(f"New best model saved to {MODEL_SAVE_PATH} with accuracy: {accuracy:.4f}")
+    test_acc = accuracy_score(true_labels, predictions)
+    f1_macro = f1_score(true_labels, predictions, average="macro", zero_division=0)
+    f1_weighted = f1_score(true_labels, predictions, average="weighted", zero_division=0)
+    auroc = float(roc_auc_score(true_labels, scores, multi_class="ovr", average="macro"))
+
+    learned_weights = F.softmax(model.expert_logits_weight.detach().cpu(), dim=0).numpy()
+    print(
+        f"Learned Expert Weights -> Demographics: {learned_weights[0]:.3f}, Notes: {learned_weights[1]:.3f}, "
+        f"Vision Dense: {learned_weights[2]:.3f}, Vision Pred: {learned_weights[3]:.3f}"
+    )
+    print(f"Best Validation Accuracy : {best_val_accuracy:.4f}")
+    print(f"Test Overall Accuracy    : {test_acc:.4f}")
+    print(f"Test Macro F1 Score      : {f1_macro:.4f}")
+    print(f"Test Weighted F1 Score   : {f1_weighted:.4f}")
+    print(f"Test Macro AUROC (OvR)   : {auroc:.4f}\n")
+
+    print("Classification Report:")
+    print(classification_report(true_labels, predictions, target_names=class_names, zero_division=0))
+
+    cm = confusion_matrix(true_labels, predictions, labels=list(range(num_classes)))
+    fig_path = save_confusion_matrix(cm, class_names, DEFAULT_FIGURES_DIR, model_name="Late_Fusion")
+    if fig_path:
+        print(f"Saved confusion matrix to: {fig_path}")
+
+    metrics_payload = {
+        "model_name": "Late Fusion",
+        "total_records": len(all_records),
+        "train_size": len(train_dataset),
+        "val_size": len(val_dataset),
+        "test_size": len(test_dataset),
+        "best_val_accuracy": float(best_val_accuracy),
+        "test_accuracy": float(test_acc),
+        "test_f1_macro": float(f1_macro),
+        "test_f1_weighted": float(f1_weighted),
+        "test_auroc_macro_ovr": auroc,
+        "expert_weights": {
+            "demographics": float(learned_weights[0]),
+            "notes": float(learned_weights[1]),
+            "vision_dense": float(learned_weights[2]),
+            "vision_pred": float(learned_weights[3]),
+        },
+        "confusion_matrix": cm.tolist(),
+    }
+    with open(DEFAULT_METRICS_PATH, "w") as f:
+        json.dump(metrics_payload, f, indent=2)
+    update_all_models_summary("late_fusion", metrics_payload)
+    print(f"Saved evaluation metrics to: {DEFAULT_METRICS_PATH}")
+
+
+if __name__ == "__main__":
+    main()

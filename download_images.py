@@ -7,11 +7,13 @@ import pandas as pd
 
 
 BASE_URL = "https://physionet.org/files/mimic-cxr-jpg/2.1.0/"
-BRONZE_CXR_DIR = "bronze/mimic_cxr"
-LIST_FILE = "bronze/mimic_cxr/cohort_image_filenames.txt"
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_LAKE_DIR = os.path.join(ROOT_DIR, "data_lake") if os.path.isdir(os.path.join(ROOT_DIR, "data_lake")) else ROOT_DIR
+BRONZE_CXR_DIR = os.path.join(DATA_LAKE_DIR, "bronze", "mimic_cxr")
+LIST_FILE = os.path.join(BRONZE_CXR_DIR, "cohort_image_filenames.txt")
 
-cohort_path = "silver/balanced_multimodal_cohort.parquet"
-out_list_path = "bronze/mimic_cxr/cohort_image_filenames.txt"
+cohort_path = os.path.join(DATA_LAKE_DIR, "silver", "balanced_multimodal_cohort.parquet")
+out_list_path = LIST_FILE
 
 def image_path():
     df = pd.read_parquet(cohort_path)

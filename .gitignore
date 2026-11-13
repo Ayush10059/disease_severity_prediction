@@ -3,5 +3,6 @@ data_lake/bronze
 data_lake/silver
 data_lake/gold
 config/
-severity_venv/
+venv/
+env/
 models/
